@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import {
   Client,
   DiscordAPIError,
@@ -13,7 +14,6 @@ import {
 import { generatePassphrase } from "./src/words.js";
 import { appendSheetRow } from "./src/sheets.js";
 import { assertHttpsUrl, logError, userFacingError } from "./src/security.js";
-import { randomUUID } from "node:crypto";
 import {
   consumePendingCheckout,
   createPendingCheckout,
@@ -59,7 +59,23 @@ function isUnknownInteraction(err) {
   );
 }
 
-/** Every user-visible bot reply must be ephemeral (private to the caller). */
+/** YYYY-MM-DD only */
+function parseMeetingDay(raw) {
+  if (!raw) return meetingDayFor();
+  const trimmed = raw.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  const [y, m, d] = trimmed.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (
+    dt.getUTCFullYear() !== y ||
+    dt.getUTCMonth() !== m - 1 ||
+    dt.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
 async function replyEphemeral(interaction, content) {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -134,6 +150,32 @@ const commands = [
         .setRequired(false),
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("comp")
+    .setDescription(
+      "Grant attendance credit when a student was absent (mentors only)",
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("Student to comp")
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("day")
+        .setDescription("Meeting day YYYY-MM-DD (default: today)")
+        .setRequired(false),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("reason")
+        .setDescription("Why this attendance is being comped")
+        .setRequired(false),
+    )
+    .toJSON(),
 ];
 
 async function registerCommands() {
@@ -181,6 +223,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleCheckout(interaction);
       return;
     }
+    if (interaction.commandName === "comp") {
+      await handleComp(interaction);
+      return;
+    }
   } catch (err) {
     logError("Command failed:", err);
     if (isUnknownInteraction(err)) return;
@@ -210,7 +256,6 @@ async function handleGeneratePassword(interaction) {
     createdByUsername: interaction.user.username,
   });
 
-  // Ephemeral + verbal announce only — do not encourage pasting the passphrase into chat
   await replyEphemeral(
     interaction,
     [
@@ -278,7 +323,7 @@ async function handleAttendance(interaction) {
       discordUserId: interaction.user.id,
       discordUsername: interaction.user.username,
       displayName,
-      // Opaque meeting id only — never send the live passphrase to Google
+      meetingDay: session.meetingDay || meetingDayFor(),
       meetingId: session.meetingId || "",
       guildId: interaction.guildId || "",
     },
@@ -349,7 +394,7 @@ async function handleStudentCheckoutRequest(interaction) {
   await replyEphemeral(
     interaction,
     [
-      "**Early leave key** — show this **in person** to a mentor before you go:",
+      "**Early leave key** � show this **in person** to a mentor before you go:",
       "",
       `\`${pending.key}\``,
       "",
@@ -390,6 +435,8 @@ async function handleMentorApproveCheckout(interaction, key) {
     return;
   }
 
+  const meetingDay = meetingDayFor();
+
   await appendSheetRow({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
@@ -399,6 +446,7 @@ async function handleMentorApproveCheckout(interaction, key) {
       discordUserId: consumed.userId,
       discordUsername: consumed.username,
       displayName: consumed.displayName,
+      meetingDay,
       checkoutKey: consumed.key,
       approvedById: interaction.user.id,
       approvedByUsername: interaction.user.username,
@@ -408,10 +456,67 @@ async function handleMentorApproveCheckout(interaction, key) {
 
   await markApprovedEarlyLeave(consumed.userId, consumed.displayName);
 
-  // Confirm who left — ephemeral to mentor only; do not restate the key
   await replyEphemeral(
     interaction,
     `Approved early leave for **${consumed.displayName}**. Logged to the Checkouts sheet.`,
+  );
+}
+
+async function handleComp(interaction) {
+  if (!isMentor(interaction)) {
+    await replyEphemeral(
+      interaction,
+      "Only mentors with **Manage Server** (or Administrator) can grant comps.",
+    );
+    return;
+  }
+
+  const user = interaction.options.getUser("user", true);
+  const dayRaw = interaction.options.getString("day");
+  const reason = (interaction.options.getString("reason") || "").trim();
+  const meetingDay = parseMeetingDay(dayRaw);
+
+  if (!meetingDay) {
+    await replyEphemeral(
+      interaction,
+      "Invalid day. Use `YYYY-MM-DD` (example: `2026-09-06`), or omit day to use today.",
+    );
+    return;
+  }
+
+  if (!(await deferEphemeral(interaction))) return;
+
+  const member = await interaction.guild?.members
+    .fetch(user.id)
+    .catch(() => null);
+  const displayName = member?.displayName || user.globalName || user.username;
+
+  await appendSheetRow({
+    webhookUrl: SHEETS_WEBHOOK_URL,
+    webhookSecret: SHEETS_WEBHOOK_SECRET,
+    type: "comp",
+    row: {
+      timestamp: new Date().toISOString(),
+      discordUserId: user.id,
+      discordUsername: user.username,
+      displayName,
+      meetingDay,
+      reason,
+      approvedById: interaction.user.id,
+      approvedByUsername: interaction.user.username,
+      guildId: interaction.guildId || "",
+    },
+  });
+
+  await replyEphemeral(
+    interaction,
+    [
+      `Comped **${displayName}** for **${meetingDay}**.`,
+      reason ? `Reason: ${reason}` : null,
+      "Logged to the Comps sheet. Add that day to the Meetings tab if it is not there yet (Sat = weight 2).",
+    ]
+      .filter(Boolean)
+      .join("\n"),
   );
 }
 

@@ -6,9 +6,9 @@
  *
  * Usage (from project root, with .env filled in):
  *   node scripts/stress-test.js
- *   node scripts/stress-test.js 50
- *   node scripts/stress-test.js 50 attendance
- *   node scripts/stress-test.js 50 attendance 8     # concurrency 8 (realistic rush)
+ *   node scripts/stress-test.js 10
+ *   node scripts/stress-test.js 10 attendance
+ *   node scripts/stress-test.js 10 attendance 8     # concurrency 8 (realistic rush)
  *   node scripts/stress-test.js 50 attendance 50    # full blast (worst case)
  *
  * Tip: use a throwaway spreadsheet / clear the Attendance tab after.
@@ -16,7 +16,7 @@
 
 import "dotenv/config";
 
-const count = Math.max(1, Number(process.argv[2] || 50));
+const count = Math.max(1, Number(process.argv[2] || 10));
 const type = (process.argv[3] || "attendance").toLowerCase();
 const concurrency = Math.max(1, Number(process.argv[4] || 8));
 const webhookUrl = process.env.SHEETS_WEBHOOK_URL;
@@ -37,7 +37,7 @@ function fakeId(i) {
   return String(900000000000000000n + BigInt(i));
 }
 
-function payload(i) {
+function payload(i, meetingId) {
   const id = fakeId(i);
   const base = {
     secret,
@@ -50,7 +50,8 @@ function payload(i) {
   };
 
   if (type === "attendance") {
-    return { ...base, meetingId: `stress-meeting-${i}` };
+    // One shared meeting id for the whole run (simulates one end-of-meeting passphrase)
+    return { ...base, meetingId };
   }
 
   return {
@@ -65,7 +66,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function oneRequest(i) {
+async function oneRequest(i, meetingId) {
   const started = performance.now();
   let lastError = null;
 
@@ -74,7 +75,7 @@ async function oneRequest(i) {
       const res = await fetch(webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload(i)),
+        body: JSON.stringify(payload(i, meetingId)),
         redirect: "follow",
       });
       const text = await res.text();
@@ -153,12 +154,16 @@ console.log(
   `Firing ${count} "${type}" webhook requests (concurrency ${concurrency}, retries on busy)…`,
 );
 console.log("Webhook URL: [redacted]");
+const sharedMeetingId = `stress-meeting-${Date.now()}`;
+if (type === "attendance") {
+  console.log(`Shared meeting ID for this run: ${sharedMeetingId}`);
+}
 const wallStart = performance.now();
 
 const results = await mapPool(
   Array.from({ length: count }, (_, i) => i + 1),
   concurrency,
-  (i) => oneRequest(i),
+  (i) => oneRequest(i, sharedMeetingId),
 );
 
 const wallMs = performance.now() - wallStart;

@@ -6,19 +6,16 @@
  * Who has access: Anyone
  *
  * Set WEBHOOK_SECRET below to the same value as SHEETS_WEBHOOK_SECRET in .env
- *
- * Concurrent appendRow() races drop rows — LockService serializes writes.
- * The bot also retries on "Sheet busy".
  */
 
 const ATTENDANCE_TAB = "Attendance";
 const CHECKOUT_TAB = "Checkouts";
+const COMPS_TAB = "Comps";
 const WEBHOOK_SECRET = "change-me-to-a-long-random-string";
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
-    // Up to 2 minutes in queue behind other attendance writes
     if (!lock.tryLock(120000)) {
       return json_({ ok: false, error: "Sheet busy — try again" });
     }
@@ -45,7 +42,31 @@ function doPost(e) {
         data.discordUserId || "",
         data.discordUsername || "",
         data.displayName || "",
+        data.meetingDay || "",
         data.checkoutKey || "",
+        data.approvedById || "",
+        data.approvedByUsername || "",
+        data.guildId || "",
+      ]);
+      SpreadsheetApp.flush();
+      return json_({ ok: true });
+    }
+
+    if (type === "comp") {
+      const sheet = ss.getSheetByName(COMPS_TAB);
+      if (!sheet) {
+        return json_({
+          ok: false,
+          error: 'Missing sheet tab named "' + COMPS_TAB + '"',
+        });
+      }
+      sheet.appendRow([
+        data.timestamp || new Date().toISOString(),
+        data.discordUserId || "",
+        data.discordUsername || "",
+        data.displayName || "",
+        data.meetingDay || "",
+        data.reason || "",
         data.approvedById || "",
         data.approvedByUsername || "",
         data.guildId || "",
@@ -67,7 +88,7 @@ function doPost(e) {
       data.discordUserId || "",
       data.discordUsername || "",
       data.displayName || "",
-      // Opaque meeting id (preferred). Legacy "passphrase" field still accepted.
+      data.meetingDay || "",
       data.meetingId || data.passphrase || "",
       data.guildId || "",
     ]);
