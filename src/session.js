@@ -134,6 +134,8 @@ export async function setSession(next) {
 }
 
 export function hasAttended(userId) {
+  // Only counts for the *current* active end-of-meeting passphrase
+  if (!isSessionValid()) return false;
   return Boolean(session?.attended?.includes(userId));
 }
 

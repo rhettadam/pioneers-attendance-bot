@@ -1,11 +1,13 @@
 /**
  * Paste this into Extensions → Apps Script for your attendance spreadsheet.
- * Then Deploy → New deployment → Web app (or Manage deployments → New version).
+ * Then Deploy → Manage deployments → Edit → New version → Deploy.
  *
  * Execute as: Me
  * Who has access: Anyone
  *
  * Set WEBHOOK_SECRET below to the same value as SHEETS_WEBHOOK_SECRET in .env
+ *
+ * Note: concurrent appendRow() calls race and drop rows. LockService serializes writes.
  */
 
 const ATTENDANCE_TAB = "Attendance";
@@ -13,7 +15,13 @@ const CHECKOUT_TAB = "Checkouts";
 const WEBHOOK_SECRET = "change-me-to-a-long-random-string";
 
 function doPost(e) {
+  const lock = LockService.getScriptLock();
   try {
+    // Wait up to 30s for other concurrent requests to finish writing
+    if (!lock.tryLock(30000)) {
+      return json_({ ok: false, error: "Sheet busy — try again" });
+    }
+
     const data = JSON.parse(e.postData.contents || "{}");
 
     if (!data.secret || data.secret !== WEBHOOK_SECRET) {
@@ -41,6 +49,7 @@ function doPost(e) {
         data.approvedByUsername || "",
         data.guildId || "",
       ]);
+      SpreadsheetApp.flush();
       return json_({ ok: true });
     }
 
@@ -60,10 +69,17 @@ function doPost(e) {
       data.passphrase || "",
       data.guildId || "",
     ]);
+    SpreadsheetApp.flush();
 
     return json_({ ok: true });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (_) {
+      // ignore
+    }
   }
 }
 

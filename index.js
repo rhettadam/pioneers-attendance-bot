@@ -304,10 +304,16 @@ async function handleStudentCheckoutRequest(interaction) {
     return;
   }
 
+  // Early leave is for leaving *before* end-of-meeting attendance.
+  // If you already marked present for the current passphrase, checkout is blocked.
   if (hasAttended(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      "Your end-of-meeting attendance is already recorded, so early leave checkout isn't needed.",
+      [
+        "Your end-of-meeting attendance is already recorded for the **current** passphrase, so early leave isn't needed.",
+        "",
+        "To test `/checkout`, have a mentor run `/generatepassword` first (that starts a fresh meeting session), then try `/checkout` **before** `/attendance`.",
+      ].join("\n"),
     );
     return;
   }
