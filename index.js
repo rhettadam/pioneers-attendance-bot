@@ -33,10 +33,8 @@ function requireEnv(name) {
 const TOKEN = requireEnv("DISCORD_TOKEN");
 const CLIENT_ID = requireEnv("DISCORD_CLIENT_ID");
 const GUILD_ID = process.env.DISCORD_GUILD_ID || "";
-const SHEET_ID = requireEnv("GOOGLE_SHEET_ID");
-const SERVICE_EMAIL = requireEnv("GOOGLE_SERVICE_ACCOUNT_EMAIL");
-const PRIVATE_KEY = requireEnv("GOOGLE_PRIVATE_KEY");
-const TAB_NAME = process.env.SHEET_TAB_NAME || "Attendance";
+const SHEETS_WEBHOOK_URL = requireEnv("SHEETS_WEBHOOK_URL");
+const SHEETS_WEBHOOK_SECRET = requireEnv("SHEETS_WEBHOOK_SECRET");
 const TTL_MINUTES = Number(process.env.PASSWORD_TTL_MINUTES || "20");
 
 const commands = [
@@ -182,10 +180,8 @@ async function handleAttendance(interaction) {
       : interaction.user.globalName || interaction.user.username;
 
   await appendAttendanceRow({
-    sheetId: SHEET_ID,
-    tabName: TAB_NAME,
-    serviceAccountEmail: SERVICE_EMAIL,
-    privateKey: PRIVATE_KEY,
+    webhookUrl: SHEETS_WEBHOOK_URL,
+    webhookSecret: SHEETS_WEBHOOK_SECRET,
     row: {
       timestamp: new Date().toISOString(),
       discordUserId: interaction.user.id,
