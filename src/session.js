@@ -5,8 +5,12 @@ import { fileURLToPath } from "node:url";
 const dataDir = join(dirname(fileURLToPath(import.meta.url)), "..", "data");
 const sessionPath = join(dataDir, "session.json");
 const checkoutsPath = join(dataDir, "checkouts.json");
+const earlyLeavesPath = join(dataDir, "early-leaves.json");
 
-/** @type {{ password: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, checkedIn: string[] } | null} */
+/** How long an approved early leave blocks end-of-meeting attendance */
+const EARLY_LEAVE_BLOCK_MS = 12 * 60 * 60 * 1000;
+
+/** @type {{ password: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, attended: string[] } | null} */
 let session = null;
 
 /**
@@ -21,8 +25,20 @@ let session = null;
  * }} PendingCheckout
  */
 
+/**
+ * @typedef {{
+ *   userId: string,
+ *   displayName: string,
+ *   approvedAt: number,
+ *   expiresAt: number,
+ * }} ApprovedEarlyLeave
+ */
+
 /** @type {PendingCheckout[]} */
 let pendingCheckouts = [];
+
+/** @type {ApprovedEarlyLeave[]} */
+let approvedEarlyLeaves = [];
 
 export async function loadSession() {
   try {
@@ -35,7 +51,11 @@ export async function loadSession() {
         createdAt: parsed.createdAt ?? Date.now(),
         createdBy: parsed.createdBy ?? "",
         createdByUsername: parsed.createdByUsername ?? "",
-        checkedIn: Array.isArray(parsed.checkedIn) ? parsed.checkedIn : [],
+        attended: Array.isArray(parsed.attended)
+          ? parsed.attended
+          : Array.isArray(parsed.checkedIn)
+            ? parsed.checkedIn
+            : [],
       };
     }
   } catch {
@@ -49,6 +69,15 @@ export async function loadSession() {
     pruneExpiredCheckouts();
   } catch {
     pendingCheckouts = [];
+  }
+
+  try {
+    const raw = await readFile(earlyLeavesPath, "utf8");
+    const parsed = JSON.parse(raw);
+    approvedEarlyLeaves = Array.isArray(parsed) ? parsed : [];
+    pruneExpiredEarlyLeaves();
+  } catch {
+    approvedEarlyLeaves = [];
   }
 
   return session;
@@ -68,9 +97,23 @@ async function persistCheckouts() {
   await writeFile(checkoutsPath, JSON.stringify(pendingCheckouts, null, 2), "utf8");
 }
 
+async function persistEarlyLeaves() {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(
+    earlyLeavesPath,
+    JSON.stringify(approvedEarlyLeaves, null, 2),
+    "utf8",
+  );
+}
+
 function pruneExpiredCheckouts() {
   const now = Date.now();
   pendingCheckouts = pendingCheckouts.filter((c) => c.expiresAt > now);
+}
+
+function pruneExpiredEarlyLeaves() {
+  const now = Date.now();
+  approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => e.expiresAt > now);
 }
 
 export function getSession() {
@@ -84,22 +127,40 @@ export function isSessionValid(current = session) {
 export async function setSession(next) {
   session = {
     ...next,
-    checkedIn: [],
+    attended: [],
   };
   await persistSession();
   return session;
 }
 
-export function hasCheckedIn(userId) {
-  return Boolean(session?.checkedIn?.includes(userId));
+export function hasAttended(userId) {
+  return Boolean(session?.attended?.includes(userId));
 }
 
-export async function markCheckedIn(userId) {
+export async function markAttended(userId) {
   if (!session) return;
-  if (!session.checkedIn.includes(userId)) {
-    session.checkedIn.push(userId);
+  if (!session.attended.includes(userId)) {
+    session.attended.push(userId);
     await persistSession();
   }
+}
+
+export function hasApprovedEarlyLeave(userId) {
+  pruneExpiredEarlyLeaves();
+  return approvedEarlyLeaves.some((e) => e.userId === userId);
+}
+
+export async function markApprovedEarlyLeave(userId, displayName) {
+  pruneExpiredEarlyLeaves();
+  approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => e.userId !== userId);
+  const now = Date.now();
+  approvedEarlyLeaves.push({
+    userId,
+    displayName,
+    approvedAt: now,
+    expiresAt: now + EARLY_LEAVE_BLOCK_MS,
+  });
+  await persistEarlyLeaves();
 }
 
 export function formatRemaining(expiresAt) {

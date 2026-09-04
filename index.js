@@ -19,10 +19,12 @@ import {
   formatRemaining,
   getPendingCheckoutForUser,
   getSession,
-  hasCheckedIn,
+  hasApprovedEarlyLeave,
+  hasAttended,
   isSessionValid,
   loadSession,
-  markCheckedIn,
+  markApprovedEarlyLeave,
+  markAttended,
   setSession,
 } from "./src/session.js";
 
@@ -54,7 +56,6 @@ function isUnknownInteraction(err) {
   );
 }
 
-/** Safe ephemeral reply/edit — never throws on expired interactions. */
 async function replyEphemeral(interaction, content) {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -97,26 +98,28 @@ const commands = [
   new SlashCommandBuilder()
     .setName("generatepassword")
     .setDescription(
-      "Generate a temporary attendance passphrase for this meeting (mentors only)",
+      "Generate the end-of-meeting attendance passphrase (mentors only)",
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setDMPermission(false)
     .toJSON(),
   new SlashCommandBuilder()
     .setName("attendance")
-    .setDescription("Check in to today's robotics meeting with the passphrase")
+    .setDescription(
+      "Mark yourself present with the end-of-meeting passphrase",
+    )
     .setDMPermission(false)
     .addStringOption((option) =>
       option
         .setName("password")
-        .setDescription("The passphrase announced at the meeting")
+        .setDescription("The passphrase announced at the end of the meeting")
         .setRequired(true),
     )
     .toJSON(),
   new SlashCommandBuilder()
     .setName("checkout")
     .setDescription(
-      "Request early checkout (students) or approve a checkout key (mentors)",
+      "Leave early: get a key (students) or approve a key (mentors)",
     )
     .setDMPermission(false)
     .addStringOption((option) =>
@@ -145,7 +148,6 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// Prevent a single Discord API error from killing the whole process
 client.on("error", (err) => {
   console.error("Discord client error:", err);
 });
@@ -205,11 +207,11 @@ async function handleGeneratePassword(interaction) {
   await replyEphemeral(
     interaction,
     [
-      `**Meeting passphrase** (expires in ${TTL_MINUTES} minutes):`,
+      `**End-of-meeting attendance passphrase** (expires in ${TTL_MINUTES} minutes):`,
       "",
       `\`${password}\``,
       "",
-      "Announce this verbally at the meeting. Students check in with:",
+      "Announce this verbally to students still present. They mark attendance with:",
       `\`/attendance password:${password}\``,
       "",
       "_Only you can see this message._",
@@ -218,7 +220,6 @@ async function handleGeneratePassword(interaction) {
 }
 
 async function handleAttendance(interaction) {
-  // Acknowledge immediately — Apps Script often takes >3s
   if (!(await deferEphemeral(interaction))) return;
 
   const submitted = interaction.options
@@ -230,7 +231,7 @@ async function handleAttendance(interaction) {
   if (!isSessionValid(session)) {
     await replyEphemeral(
       interaction,
-      "There is no active attendance passphrase right now (or it expired). Ask a mentor/admin to run `/generatepassword`.",
+      "There is no active attendance passphrase right now (or it expired). Ask a mentor to run `/generatepassword` at the end of the meeting.",
     );
     return;
   }
@@ -238,15 +239,23 @@ async function handleAttendance(interaction) {
   if (submitted !== session.password.toLowerCase()) {
     await replyEphemeral(
       interaction,
-      "That passphrase is incorrect. Double-check what was announced at the meeting.",
+      "That passphrase is incorrect. Double-check what was announced at the end of the meeting.",
     );
     return;
   }
 
-  if (hasCheckedIn(interaction.user.id)) {
+  if (hasApprovedEarlyLeave(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      `You're already checked in for this meeting passphrase. (${formatRemaining(session.expiresAt)} left)`,
+      "You already completed an **early leave** checkout for this meeting, so end-of-meeting attendance doesn't apply.",
+    );
+    return;
+  }
+
+  if (hasAttended(interaction.user.id)) {
+    await replyEphemeral(
+      interaction,
+      `Your attendance is already recorded for this passphrase. (${formatRemaining(session.expiresAt)} left)`,
     );
     return;
   }
@@ -267,11 +276,11 @@ async function handleAttendance(interaction) {
     },
   });
 
-  await markCheckedIn(interaction.user.id);
+  await markAttended(interaction.user.id);
 
   await replyEphemeral(
     interaction,
-    `Checked in as **${displayName}**. Thanks — see you at the meeting!\n_(Passphrase expires in ${formatRemaining(session.expiresAt)})_`,
+    `Attendance recorded for **${displayName}**.`,
   );
 }
 
@@ -287,11 +296,18 @@ async function handleCheckout(interaction) {
 }
 
 async function handleStudentCheckoutRequest(interaction) {
-  const session = getSession();
-  if (!isSessionValid(session) || !hasCheckedIn(interaction.user.id)) {
+  if (hasApprovedEarlyLeave(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      "You must check in with `/attendance` for today's meeting before requesting an early checkout.",
+      "A mentor already approved your early leave for this meeting.",
+    );
+    return;
+  }
+
+  if (hasAttended(interaction.user.id)) {
+    await replyEphemeral(
+      interaction,
+      "Your end-of-meeting attendance is already recorded, so early leave checkout isn't needed.",
     );
     return;
   }
@@ -301,7 +317,7 @@ async function handleStudentCheckoutRequest(interaction) {
     await replyEphemeral(
       interaction,
       [
-        "You already have an active checkout key. Show this to a mentor:",
+        "You already have an active early-leave key. Show this to a mentor before you leave:",
         "",
         `\`${existing.key}\``,
         "",
@@ -323,12 +339,12 @@ async function handleStudentCheckoutRequest(interaction) {
   await replyEphemeral(
     interaction,
     [
-      "**Early checkout key** (show this to a mentor):",
+      "**Early leave key** — show this to a mentor before you go:",
       "",
       `\`${pending.key}\``,
       "",
-      `This key expires in ${CHECKOUT_TTL_MINUTES} minutes.`,
-      "A mentor must run `/checkout key:" + pending.key + "` to approve.",
+      `Expires in ${CHECKOUT_TTL_MINUTES} minutes.`,
+      "Mentor runs: `/checkout key:" + pending.key + "`",
       "",
       "_Only you can see this message._",
     ].join("\n"),
@@ -339,19 +355,18 @@ async function handleMentorApproveCheckout(interaction, key) {
   if (!isMentor(interaction)) {
     await replyEphemeral(
       interaction,
-      "Only mentors with **Manage Server** (or Administrator) can approve checkout keys.",
+      "Only mentors with **Manage Server** (or Administrator) can approve early-leave keys.",
     );
     return;
   }
 
-  // Acknowledge before Sheets write
   if (!(await deferEphemeral(interaction))) return;
 
   const pending = findPendingCheckout(key);
   if (!pending) {
     await replyEphemeral(
       interaction,
-      "That checkout key is invalid or expired. Ask the student to run `/checkout` again.",
+      "That key is invalid or expired. Ask the student to run `/checkout` again.",
     );
     return;
   }
@@ -360,7 +375,7 @@ async function handleMentorApproveCheckout(interaction, key) {
   if (!consumed) {
     await replyEphemeral(
       interaction,
-      "That checkout key is invalid or expired. Ask the student to run `/checkout` again.",
+      "That key is invalid or expired. Ask the student to run `/checkout` again.",
     );
     return;
   }
@@ -381,10 +396,12 @@ async function handleMentorApproveCheckout(interaction, key) {
     },
   });
 
+  await markApprovedEarlyLeave(consumed.userId, consumed.displayName);
+
   await replyEphemeral(
     interaction,
     [
-      `Approved early checkout for **${consumed.displayName}** (\`${consumed.username}\`).`,
+      `Approved early leave for **${consumed.displayName}** (\`${consumed.username}\`).`,
       `Key: \`${consumed.key}\``,
       "Logged to the **Checkouts** sheet.",
     ].join("\n"),
