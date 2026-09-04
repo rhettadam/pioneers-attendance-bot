@@ -7,7 +7,8 @@
  *
  * Set WEBHOOK_SECRET below to the same value as SHEETS_WEBHOOK_SECRET in .env
  *
- * Note: concurrent appendRow() calls race and drop rows. LockService serializes writes.
+ * Concurrent appendRow() races drop rows — LockService serializes writes.
+ * The bot also retries on "Sheet busy".
  */
 
 const ATTENDANCE_TAB = "Attendance";
@@ -17,8 +18,8 @@ const WEBHOOK_SECRET = "change-me-to-a-long-random-string";
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
-    // Wait up to 30s for other concurrent requests to finish writing
-    if (!lock.tryLock(30000)) {
+    // Up to 2 minutes in queue behind other attendance writes
+    if (!lock.tryLock(120000)) {
       return json_({ ok: false, error: "Sheet busy — try again" });
     }
 
