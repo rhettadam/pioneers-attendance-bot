@@ -67,7 +67,8 @@ function doPost(e) {
       data.discordUserId || "",
       data.discordUsername || "",
       data.displayName || "",
-      data.passphrase || "",
+      // Opaque meeting id (preferred). Legacy "passphrase" field still accepted.
+      data.meetingId || data.passphrase || "",
       data.guildId || "",
     ]);
     SpreadsheetApp.flush();

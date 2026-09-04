@@ -10,7 +10,7 @@ const earlyLeavesPath = join(dataDir, "early-leaves.json");
 /** How long an approved early leave blocks end-of-meeting attendance */
 const EARLY_LEAVE_BLOCK_MS = 12 * 60 * 60 * 1000;
 
-/** @type {{ password: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, attended: string[] } | null} */
+/** @type {{ password: string, meetingId: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, attended: string[] } | null} */
 let session = null;
 
 /**
@@ -47,6 +47,7 @@ export async function loadSession() {
     if (parsed?.password && parsed?.expiresAt) {
       session = {
         password: parsed.password,
+        meetingId: parsed.meetingId || "",
         expiresAt: parsed.expiresAt,
         createdAt: parsed.createdAt ?? Date.now(),
         createdBy: parsed.createdBy ?? "",
@@ -127,6 +128,7 @@ export function isSessionValid(current = session) {
 export async function setSession(next) {
   session = {
     ...next,
+    meetingId: next.meetingId || "",
     attended: [],
   };
   await persistSession();
