@@ -12,6 +12,8 @@ import {
 } from "discord.js";
 import { generatePassphrase } from "./src/words.js";
 import { appendSheetRow } from "./src/sheets.js";
+import { assertHttpsUrl, logError, userFacingError } from "./src/security.js";
+import { randomUUID } from "node:crypto";
 import {
   consumePendingCheckout,
   createPendingCheckout,
@@ -25,6 +27,7 @@ import {
   loadSession,
   markApprovedEarlyLeave,
   markAttended,
+  meetingDayFor,
   setSession,
 } from "./src/session.js";
 
@@ -56,6 +59,7 @@ function isUnknownInteraction(err) {
   );
 }
 
+/** Every user-visible bot reply must be ephemeral (private to the caller). */
 async function replyEphemeral(interaction, content) {
   try {
     if (interaction.deferred || interaction.replied) {
@@ -68,7 +72,7 @@ async function replyEphemeral(interaction, content) {
       console.warn("Interaction expired before reply could be sent.");
       return;
     }
-    console.error("Failed to reply to interaction:", err);
+    logError("Failed to reply to interaction:", err);
   }
 }
 
@@ -91,6 +95,7 @@ const CLIENT_ID = requireEnv("DISCORD_CLIENT_ID");
 const GUILD_ID = process.env.DISCORD_GUILD_ID || "";
 const SHEETS_WEBHOOK_URL = requireEnv("SHEETS_WEBHOOK_URL");
 const SHEETS_WEBHOOK_SECRET = requireEnv("SHEETS_WEBHOOK_SECRET");
+assertHttpsUrl(SHEETS_WEBHOOK_URL, "SHEETS_WEBHOOK_URL");
 const TTL_MINUTES = Number(process.env.PASSWORD_TTL_MINUTES || "20");
 const CHECKOUT_TTL_MINUTES = Number(process.env.CHECKOUT_KEY_TTL_MINUTES || "15");
 
@@ -112,7 +117,7 @@ const commands = [
     .addStringOption((option) =>
       option
         .setName("password")
-        .setDescription("The passphrase announced at the end of the meeting")
+        .setDescription("The passphrase announced verbally at the end of the meeting")
         .setRequired(true),
     )
     .toJSON(),
@@ -137,10 +142,10 @@ async function registerCommands() {
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
       body: commands,
     });
-    console.log(`Registered guild slash commands for ${GUILD_ID}`);
+    console.log("Registered guild slash commands.");
   } else {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log("Registered global slash commands (may take up to ~1 hour)");
+    console.log("Registered global slash commands (may take up to ~1 hour).");
   }
 }
 
@@ -149,11 +154,11 @@ const client = new Client({
 });
 
 client.on("error", (err) => {
-  console.error("Discord client error:", err);
+  logError("Discord client error:", err);
 });
 
 process.on("unhandledRejection", (err) => {
-  console.error("Unhandled promise rejection:", err);
+  logError("Unhandled promise rejection:", err);
 });
 
 client.once(Events.ClientReady, (readyClient) => {
@@ -177,11 +182,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
   } catch (err) {
-    console.error(err);
+    logError("Command failed:", err);
     if (isUnknownInteraction(err)) return;
-    const message =
-      err instanceof Error ? err.message : "Something went wrong.";
-    await replyEphemeral(interaction, `Error: ${message}`);
+    await replyEphemeral(interaction, userFacingError(err));
   }
 });
 
@@ -196,14 +199,18 @@ async function handleGeneratePassword(interaction) {
 
   const now = Date.now();
   const password = generatePassphrase(3);
+  const meetingId = randomUUID();
   await setSession({
     password,
+    meetingId,
+    meetingDay: meetingDayFor(),
     createdAt: now,
     expiresAt: now + TTL_MINUTES * 60_000,
     createdBy: interaction.user.id,
     createdByUsername: interaction.user.username,
   });
 
+  // Ephemeral + verbal announce only — do not encourage pasting the passphrase into chat
   await replyEphemeral(
     interaction,
     [
@@ -211,8 +218,8 @@ async function handleGeneratePassword(interaction) {
       "",
       `\`${password}\``,
       "",
-      "Announce this verbally to students still present. They mark attendance with:",
-      `\`/attendance password:${password}\``,
+      "**Announce this out loud** to students still present. Do not post it in Discord chat.",
+      "Students then privately run `/attendance` and type the passphrase.",
       "",
       "_Only you can see this message._",
     ].join("\n"),
@@ -231,7 +238,7 @@ async function handleAttendance(interaction) {
   if (!isSessionValid(session)) {
     await replyEphemeral(
       interaction,
-      "There is no active attendance passphrase right now (or it expired). Ask a mentor to run `/generatepassword` at the end of the meeting.",
+      "There is no active attendance passphrase right now (or it expired). Ask a mentor for help at the end of the meeting.",
     );
     return;
   }
@@ -239,7 +246,7 @@ async function handleAttendance(interaction) {
   if (submitted !== session.password.toLowerCase()) {
     await replyEphemeral(
       interaction,
-      "That passphrase is incorrect. Double-check what was announced at the end of the meeting.",
+      "That passphrase is incorrect. Ask a mentor to repeat what was announced.",
     );
     return;
   }
@@ -247,7 +254,7 @@ async function handleAttendance(interaction) {
   if (hasApprovedEarlyLeave(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      "You already completed an **early leave** checkout for this meeting, so end-of-meeting attendance doesn't apply.",
+      "You already completed an **early leave** today, so end-of-meeting attendance does not apply for you.",
     );
     return;
   }
@@ -255,7 +262,7 @@ async function handleAttendance(interaction) {
   if (hasAttended(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      `Your attendance is already recorded for this passphrase. (${formatRemaining(session.expiresAt)} left)`,
+      "Your attendance is already recorded for this meeting.",
     );
     return;
   }
@@ -271,7 +278,8 @@ async function handleAttendance(interaction) {
       discordUserId: interaction.user.id,
       discordUsername: interaction.user.username,
       displayName,
-      passphrase: session.password,
+      // Opaque meeting id only — never send the live passphrase to Google
+      meetingId: session.meetingId || "",
       guildId: interaction.guildId || "",
     },
   });
@@ -304,16 +312,10 @@ async function handleStudentCheckoutRequest(interaction) {
     return;
   }
 
-  // Early leave is for leaving *before* end-of-meeting attendance.
-  // If you already marked present for the current passphrase, checkout is blocked.
   if (hasAttended(interaction.user.id)) {
     await replyEphemeral(
       interaction,
-      [
-        "Your end-of-meeting attendance is already recorded for the **current** passphrase, so early leave isn't needed.",
-        "",
-        "To test `/checkout`, have a mentor run `/generatepassword` first (that starts a fresh meeting session), then try `/checkout` **before** `/attendance`.",
-      ].join("\n"),
+      "Your end-of-meeting attendance is already recorded, so early leave is not needed.",
     );
     return;
   }
@@ -323,12 +325,14 @@ async function handleStudentCheckoutRequest(interaction) {
     await replyEphemeral(
       interaction,
       [
-        "You already have an active early-leave key. Show this to a mentor before you leave:",
+        "You already have an active early-leave key. Show this **in person** to a mentor before you leave:",
         "",
         `\`${existing.key}\``,
         "",
         `Expires in ${formatRemaining(existing.expiresAt)}.`,
-        "Mentor runs: `/checkout key:" + existing.key + "`",
+        "Do not post this key in Discord chat.",
+        "",
+        "_Only you can see this message._",
       ].join("\n"),
     );
     return;
@@ -345,12 +349,12 @@ async function handleStudentCheckoutRequest(interaction) {
   await replyEphemeral(
     interaction,
     [
-      "**Early leave key** — show this to a mentor before you go:",
+      "**Early leave key** — show this **in person** to a mentor before you go:",
       "",
       `\`${pending.key}\``,
       "",
       `Expires in ${CHECKOUT_TTL_MINUTES} minutes.`,
-      "Mentor runs: `/checkout key:" + pending.key + "`",
+      "Do not post this key in Discord chat.",
       "",
       "_Only you can see this message._",
     ].join("\n"),
@@ -372,7 +376,7 @@ async function handleMentorApproveCheckout(interaction, key) {
   if (!pending) {
     await replyEphemeral(
       interaction,
-      "That key is invalid or expired. Ask the student to run `/checkout` again.",
+      "That key is invalid or expired. Ask the student to run `/checkout` again and show you the new key in person.",
     );
     return;
   }
@@ -381,7 +385,7 @@ async function handleMentorApproveCheckout(interaction, key) {
   if (!consumed) {
     await replyEphemeral(
       interaction,
-      "That key is invalid or expired. Ask the student to run `/checkout` again.",
+      "That key is invalid or expired. Ask the student to run `/checkout` again and show you the new key in person.",
     );
     return;
   }
@@ -404,13 +408,10 @@ async function handleMentorApproveCheckout(interaction, key) {
 
   await markApprovedEarlyLeave(consumed.userId, consumed.displayName);
 
+  // Confirm who left — ephemeral to mentor only; do not restate the key
   await replyEphemeral(
     interaction,
-    [
-      `Approved early leave for **${consumed.displayName}** (\`${consumed.username}\`).`,
-      `Key: \`${consumed.key}\``,
-      "Logged to the **Checkouts** sheet.",
-    ].join("\n"),
+    `Approved early leave for **${consumed.displayName}**. Logged to the Checkouts sheet.`,
   );
 }
 

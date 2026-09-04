@@ -7,10 +7,10 @@ const sessionPath = join(dataDir, "session.json");
 const checkoutsPath = join(dataDir, "checkouts.json");
 const earlyLeavesPath = join(dataDir, "early-leaves.json");
 
-/** How long an approved early leave blocks end-of-meeting attendance */
-const EARLY_LEAVE_BLOCK_MS = 12 * 60 * 60 * 1000;
+/** Team local calendar day for early-leave ↔ end-attendance binding */
+const TEAM_TIMEZONE = process.env.TEAM_TIMEZONE || "America/Chicago";
 
-/** @type {{ password: string, meetingId: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, attended: string[] } | null} */
+/** @type {{ password: string, meetingId: string, meetingDay: string, expiresAt: number, createdAt: number, createdBy: string, createdByUsername: string, attended: string[] } | null} */
 let session = null;
 
 /**
@@ -29,8 +29,8 @@ let session = null;
  * @typedef {{
  *   userId: string,
  *   displayName: string,
+ *   meetingDay: string,
  *   approvedAt: number,
- *   expiresAt: number,
  * }} ApprovedEarlyLeave
  */
 
@@ -40,6 +40,15 @@ let pendingCheckouts = [];
 /** @type {ApprovedEarlyLeave[]} */
 let approvedEarlyLeaves = [];
 
+export function meetingDayFor(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TEAM_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
 export async function loadSession() {
   try {
     const raw = await readFile(sessionPath, "utf8");
@@ -48,6 +57,9 @@ export async function loadSession() {
       session = {
         password: parsed.password,
         meetingId: parsed.meetingId || "",
+        meetingDay:
+          parsed.meetingDay ||
+          meetingDayFor(new Date(parsed.createdAt || Date.now())),
         expiresAt: parsed.expiresAt,
         createdAt: parsed.createdAt ?? Date.now(),
         createdBy: parsed.createdBy ?? "",
@@ -76,7 +88,7 @@ export async function loadSession() {
     const raw = await readFile(earlyLeavesPath, "utf8");
     const parsed = JSON.parse(raw);
     approvedEarlyLeaves = Array.isArray(parsed) ? parsed : [];
-    pruneExpiredEarlyLeaves();
+    pruneOldEarlyLeaves();
   } catch {
     approvedEarlyLeaves = [];
   }
@@ -112,9 +124,14 @@ function pruneExpiredCheckouts() {
   pendingCheckouts = pendingCheckouts.filter((c) => c.expiresAt > now);
 }
 
-function pruneExpiredEarlyLeaves() {
-  const now = Date.now();
-  approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => e.expiresAt > now);
+/** Drop early-leave records older than yesterday (team timezone). */
+function pruneOldEarlyLeaves() {
+  const today = meetingDayFor();
+  const yesterday = meetingDayFor(new Date(Date.now() - 36 * 60 * 60 * 1000));
+  approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => {
+    const day = e.meetingDay || meetingDayFor(new Date(e.approvedAt || 0));
+    return day === today || day === yesterday;
+  });
 }
 
 export function getSession() {
@@ -126,17 +143,20 @@ export function isSessionValid(current = session) {
 }
 
 export async function setSession(next) {
+  const meetingDay = next.meetingDay || meetingDayFor();
   session = {
     ...next,
     meetingId: next.meetingId || "",
+    meetingDay,
     attended: [],
   };
+  pruneOldEarlyLeaves();
+  await persistEarlyLeaves();
   await persistSession();
   return session;
 }
 
 export function hasAttended(userId) {
-  // Only counts for the *current* active end-of-meeting passphrase
   if (!isSessionValid()) return false;
   return Boolean(session?.attended?.includes(userId));
 }
@@ -149,21 +169,34 @@ export async function markAttended(userId) {
   }
 }
 
+/**
+ * Early leave blocks end-of-meeting attendance for the same team-local calendar day.
+ */
 export function hasApprovedEarlyLeave(userId) {
-  pruneExpiredEarlyLeaves();
-  return approvedEarlyLeaves.some((e) => e.userId === userId);
+  pruneOldEarlyLeaves();
+  const day = session?.meetingDay || meetingDayFor();
+  return approvedEarlyLeaves.some((e) => {
+    const leaveDay =
+      e.meetingDay || meetingDayFor(new Date(e.approvedAt || 0));
+    return e.userId === userId && leaveDay === day;
+  });
 }
 
 export async function markApprovedEarlyLeave(userId, displayName) {
-  pruneExpiredEarlyLeaves();
+  pruneOldEarlyLeaves();
+  const meetingDay = meetingDayFor();
   approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => e.userId !== userId);
-  const now = Date.now();
   approvedEarlyLeaves.push({
     userId,
     displayName,
-    approvedAt: now,
-    expiresAt: now + EARLY_LEAVE_BLOCK_MS,
+    meetingDay,
+    approvedAt: Date.now(),
   });
+  await persistEarlyLeaves();
+}
+
+export async function clearEarlyLeave(userId) {
+  approvedEarlyLeaves = approvedEarlyLeaves.filter((e) => e.userId !== userId);
   await persistEarlyLeaves();
 }
 
@@ -184,10 +217,6 @@ function makeCheckoutKey() {
   return key;
 }
 
-/**
- * Create (or replace) a pending checkout key for a student.
- * @returns {Promise<PendingCheckout>}
- */
 export async function createPendingCheckout({
   userId,
   username,
