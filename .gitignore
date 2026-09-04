@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime session file
+data/
+
+# Dependencies (bot-hosting installs these for you — do not upload)
+node_modules/
+package-lock.json
+
+# Google service account key files
+*-service-account*.json
+service-account*.json
+credentials.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+.wrangler/
+dist/
+.dev.vars
