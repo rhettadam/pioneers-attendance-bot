@@ -5,22 +5,22 @@
  * @param {{
  *   webhookUrl: string,
  *   webhookSecret: string,
- *   row: {
- *     timestamp: string,
- *     discordUserId: string,
- *     discordUsername: string,
- *     displayName: string,
- *     passphrase: string,
- *     guildId: string,
- *   },
+ *   type: "attendance" | "checkout",
+ *   row: Record<string, string>,
  * }} args
  */
-export async function appendAttendanceRow({ webhookUrl, webhookSecret, row }) {
+export async function appendSheetRow({
+  webhookUrl,
+  webhookSecret,
+  type,
+  row,
+}) {
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       secret: webhookSecret,
+      type,
       ...row,
     }),
     redirect: "follow",
