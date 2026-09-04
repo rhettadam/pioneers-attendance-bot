@@ -1,0 +1,19 @@
+{
+  "name": "pioneers-attendance-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Discord attendance bot for robotics team meetings — bot-hosting.net + Google Sheets",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7"
+  }
+}
