@@ -76,13 +76,17 @@ function parseMeetingDay(raw) {
   return trimmed;
 }
 
-async function replyEphemeral(interaction, content) {
+async function replyToInteraction(interaction, content, { ephemeral = true } = {}) {
   try {
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ content });
       return;
     }
-    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    await interaction.reply(
+      ephemeral
+        ? { content, flags: MessageFlags.Ephemeral }
+        : { content },
+    );
   } catch (err) {
     if (isUnknownInteraction(err)) {
       console.warn("Interaction expired before reply could be sent.");
@@ -92,10 +96,20 @@ async function replyEphemeral(interaction, content) {
   }
 }
 
-async function deferEphemeral(interaction) {
+async function replyEphemeral(interaction, content) {
+  await replyToInteraction(interaction, content, { ephemeral: true });
+}
+
+async function replyPublic(interaction, content) {
+  await replyToInteraction(interaction, content, { ephemeral: false });
+}
+
+async function deferReply(interaction, { ephemeral = true } = {}) {
   try {
     if (interaction.deferred || interaction.replied) return true;
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.deferReply(
+      ephemeral ? { flags: MessageFlags.Ephemeral } : {},
+    );
     return true;
   } catch (err) {
     if (isUnknownInteraction(err)) {
@@ -104,6 +118,14 @@ async function deferEphemeral(interaction) {
     }
     throw err;
   }
+}
+
+async function deferEphemeral(interaction) {
+  return deferReply(interaction, { ephemeral: true });
+}
+
+async function deferPublic(interaction) {
+  return deferReply(interaction, { ephemeral: false });
 }
 
 const TOKEN = requireEnv("DISCORD_TOKEN");
@@ -264,7 +286,7 @@ async function handleGeneratePassword(interaction) {
       `\`${password}\``,
       "",
       "**Announce this out loud** to students still present. Do not post it in Discord chat.",
-      "Students then privately run `/attendance` and type the passphrase.",
+      "Students then run `/attendance` in their channel and type the passphrase.",
       "",
       "_Only you can see this message._",
     ].join("\n"),
@@ -272,7 +294,8 @@ async function handleGeneratePassword(interaction) {
 }
 
 async function handleAttendance(interaction) {
-  if (!(await deferEphemeral(interaction))) return;
+  // Public reply so mentors can see check-ins in the student's private channel.
+  if (!(await deferPublic(interaction))) return;
 
   const submitted = interaction.options
     .getString("password", true)
@@ -281,7 +304,7 @@ async function handleAttendance(interaction) {
   const session = getSession();
 
   if (!isSessionValid(session)) {
-    await replyEphemeral(
+    await replyPublic(
       interaction,
       "There is no active attendance passphrase right now (or it expired). Ask a mentor for help at the end of the meeting.",
     );
@@ -289,7 +312,7 @@ async function handleAttendance(interaction) {
   }
 
   if (submitted !== session.password.toLowerCase()) {
-    await replyEphemeral(
+    await replyPublic(
       interaction,
       "That passphrase is incorrect. Ask a mentor to repeat what was announced.",
     );
@@ -297,7 +320,7 @@ async function handleAttendance(interaction) {
   }
 
   if (hasApprovedEarlyLeave(interaction.user.id)) {
-    await replyEphemeral(
+    await replyPublic(
       interaction,
       "You already completed an **early leave** today, so end-of-meeting attendance does not apply for you.",
     );
@@ -305,7 +328,7 @@ async function handleAttendance(interaction) {
   }
 
   if (hasAttended(interaction.user.id)) {
-    await replyEphemeral(
+    await replyPublic(
       interaction,
       "Your attendance is already recorded for this meeting.",
     );
@@ -331,7 +354,7 @@ async function handleAttendance(interaction) {
 
   await markAttended(interaction.user.id);
 
-  await replyEphemeral(
+  await replyPublic(
     interaction,
     `Attendance recorded for **${displayName}**.`,
   );
@@ -394,7 +417,7 @@ async function handleStudentCheckoutRequest(interaction) {
   await replyEphemeral(
     interaction,
     [
-      "**Early leave key** — show this **in person** to a mentor before you go:",
+      "**Early leave key** ? show this **in person** to a mentor before you go:",
       "",
       `\`${pending.key}\``,
       "",
