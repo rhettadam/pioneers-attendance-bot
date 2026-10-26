@@ -6,8 +6,8 @@
  * @param {{
  *   webhookUrl: string,
  *   webhookSecret: string,
- *   type: "attendance" | "checkout",
- *   row: Record<string, string>,
+ *   type: "attendance" | "checkout" | "comp" | "raised",
+ *   row: Record<string, string | number>,
  * }} args
  */
 export async function appendSheetRow({
@@ -16,6 +16,45 @@ export async function appendSheetRow({
   type,
   row,
 }) {
+  return postSheetJson({
+    webhookUrl,
+    webhookSecret,
+    body: { type, ...row },
+  });
+}
+
+/**
+ * Append several rows in one webhook POST (`students` array).
+ * Used by `/comp` and `/raised` so a mention list is one sheet lock.
+ *
+ * @param {{
+ *   webhookUrl: string,
+ *   webhookSecret: string,
+ *   type: "comp" | "raised",
+ *   students: Record<string, string | number>[],
+ * }} args
+ */
+export async function appendSheetRows({
+  webhookUrl,
+  webhookSecret,
+  type,
+  students,
+}) {
+  return postSheetJson({
+    webhookUrl,
+    webhookSecret,
+    body: { type, students },
+  });
+}
+
+/**
+ * @param {{
+ *   webhookUrl: string,
+ *   webhookSecret: string,
+ *   body: Record<string, unknown>,
+ * }} args
+ */
+async function postSheetJson({ webhookUrl, webhookSecret, body }) {
   assertHttps(webhookUrl);
 
   const maxAttempts = 6;
@@ -29,8 +68,7 @@ export async function appendSheetRow({
         // Secret travels in the TLS-encrypted JSON body — never as a query param
         body: JSON.stringify({
           secret: webhookSecret,
-          type,
-          ...row,
+          ...body,
         }),
       });
 

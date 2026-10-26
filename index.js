@@ -12,7 +12,7 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import { generatePassphrase } from "./src/words.js";
-import { appendSheetRow } from "./src/sheets.js";
+import { appendSheetRow, appendSheetRows } from "./src/sheets.js";
 import { assertHttpsUrl, logError, userFacingError } from "./src/security.js";
 import {
   consumePendingCheckout,
@@ -59,6 +59,8 @@ function isUnknownInteraction(err) {
   );
 }
 
+const MAX_STUDENTS_PER_COMMAND = 25;
+
 /** YYYY-MM-DD only */
 function parseMeetingDay(raw) {
   if (!raw) return meetingDayFor();
@@ -74,6 +76,92 @@ function parseMeetingDay(raw) {
     return null;
   }
   return trimmed;
+}
+
+function parseMentionIds(text) {
+  if (!text) return [];
+  const ids = [];
+  const mention = /<@!?(\d{17,20})>/g;
+  let match;
+  while ((match = mention.exec(text)) !== null) {
+    ids.push(match[1]);
+  }
+  return ids;
+}
+
+function collectStudentIds(interaction) {
+  const ids = [];
+  const seen = new Set();
+
+  const add = (id) => {
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+
+  const user = interaction.options.getUser("user");
+  if (user) add(user.id);
+  for (const id of parseMentionIds(interaction.options.getString("users") || "")) {
+    add(id);
+  }
+  return ids;
+}
+
+function studentListError(interaction) {
+  const ids = collectStudentIds(interaction);
+  const usersRaw = (interaction.options.getString("users") || "").trim();
+
+  if (ids.length === 0) {
+    if (usersRaw) {
+      return "Mention students with `@name` in `users` (or pick someone in `user`). Typed names are not matched.";
+    }
+    return "Choose a student in `user`, or mention a list in `users`.";
+  }
+  if (ids.length > MAX_STUDENTS_PER_COMMAND) {
+    return `You can list at most ${MAX_STUDENTS_PER_COMMAND} students in one command.`;
+  }
+  return null;
+}
+
+async function resolveStudents(interaction, ids) {
+  const students = [];
+  const unresolved = [];
+
+  for (const id of ids) {
+    const member = await interaction.guild?.members.fetch(id).catch(() => null);
+    if (member) {
+      students.push({
+        discordUserId: member.id,
+        discordUsername: member.user.username,
+        displayName:
+          member.displayName || member.user.globalName || member.user.username,
+      });
+      continue;
+    }
+
+    const user = await interaction.client.users.fetch(id).catch(() => null);
+    if (user) {
+      students.push({
+        discordUserId: user.id,
+        discordUsername: user.username,
+        displayName: user.globalName || user.username,
+      });
+      continue;
+    }
+
+    unresolved.push(id);
+  }
+
+  return { students, unresolved };
+}
+
+function formatStudentNames(students) {
+  return students.map((student) => `**${student.displayName}**`).join(", ");
+}
+
+function formatRaisedAmount(raw) {
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  return Math.round(raw * 100) / 100;
 }
 
 async function replyToInteraction(interaction, content, { ephemeral = true } = {}) {
@@ -175,15 +263,21 @@ const commands = [
   new SlashCommandBuilder()
     .setName("comp")
     .setDescription(
-      "Grant attendance credit when a student was absent (mentors only)",
+      "Grant attendance credit for one student or a mention list (mentors only)",
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setDMPermission(false)
     .addUserOption((option) =>
       option
         .setName("user")
-        .setDescription("Student to comp")
-        .setRequired(true),
+        .setDescription("One student to comp")
+        .setRequired(false),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("users")
+        .setDescription("Mention a list of students (@name @name)")
+        .setRequired(false),
     )
     .addStringOption((option) =>
       option
@@ -195,6 +289,45 @@ const commands = [
       option
         .setName("reason")
         .setDescription("Why this attendance is being comped")
+        .setRequired(false),
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("raised")
+    .setDescription(
+      "Log dollars raised for one student or a mention list (mentors only)",
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
+    .addNumberOption((option) =>
+      option
+        .setName("amount")
+        .setDescription("Dollars credited to each listed student")
+        .setRequired(true)
+        .setMinValue(0.01),
+    )
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("One student who raised this amount")
+        .setRequired(false),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("users")
+        .setDescription("Mention a list of students (@name @name)")
+        .setRequired(false),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("day")
+        .setDescription("Day YYYY-MM-DD (default: today)")
+        .setRequired(false),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("note")
+        .setDescription("What the money was raised for")
         .setRequired(false),
     )
     .toJSON(),
@@ -247,6 +380,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.commandName === "comp") {
       await handleComp(interaction);
+      return;
+    }
+    if (interaction.commandName === "raised") {
+      await handleRaised(interaction);
       return;
     }
   } catch (err) {
@@ -494,7 +631,12 @@ async function handleComp(interaction) {
     return;
   }
 
-  const user = interaction.options.getUser("user", true);
+  const listError = studentListError(interaction);
+  if (listError) {
+    await replyEphemeral(interaction, listError);
+    return;
+  }
+
   const dayRaw = interaction.options.getString("day");
   const reason = (interaction.options.getString("reason") || "").trim();
   const meetingDay = parseMeetingDay(dayRaw);
@@ -509,34 +651,124 @@ async function handleComp(interaction) {
 
   if (!(await deferEphemeral(interaction))) return;
 
-  const member = await interaction.guild?.members
-    .fetch(user.id)
-    .catch(() => null);
-  const displayName = member?.displayName || user.globalName || user.username;
+  const { students, unresolved } = await resolveStudents(
+    interaction,
+    collectStudentIds(interaction),
+  );
+  if (unresolved.length > 0 || students.length === 0) {
+    await replyEphemeral(
+      interaction,
+      "Could not resolve one or more mentioned students. Use `@name` for people in this server.",
+    );
+    return;
+  }
 
-  await appendSheetRow({
+  const timestamp = new Date().toISOString();
+  await appendSheetRows({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
     type: "comp",
-    row: {
-      timestamp: new Date().toISOString(),
-      discordUserId: user.id,
-      discordUsername: user.username,
-      displayName,
+    students: students.map((student) => ({
+      timestamp,
+      discordUserId: student.discordUserId,
+      discordUsername: student.discordUsername,
+      displayName: student.displayName,
       meetingDay,
       reason,
       approvedById: interaction.user.id,
       approvedByUsername: interaction.user.username,
       guildId: interaction.guildId || "",
-    },
+    })),
   });
 
   await replyEphemeral(
     interaction,
     [
-      `Comped **${displayName}** for **${meetingDay}**.`,
+      `Comped ${formatStudentNames(students)} for **${meetingDay}**.`,
       reason ? `Reason: ${reason}` : null,
       "Logged to the Comps sheet. Add that day to the Meetings tab if it is not there yet (Sat = weight 2).",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  );
+}
+
+async function handleRaised(interaction) {
+  if (!isMentor(interaction)) {
+    await replyEphemeral(
+      interaction,
+      "Only mentors with **Manage Server** (or Administrator) can log money raised.",
+    );
+    return;
+  }
+
+  const amount = formatRaisedAmount(interaction.options.getNumber("amount", true));
+  if (amount == null) {
+    await replyEphemeral(
+      interaction,
+      "Amount must be a positive dollar value (example: `50` or `12.50`).",
+    );
+    return;
+  }
+
+  const listError = studentListError(interaction);
+  if (listError) {
+    await replyEphemeral(interaction, listError);
+    return;
+  }
+
+  const dayRaw = interaction.options.getString("day");
+  const note = (interaction.options.getString("note") || "").trim();
+  const meetingDay = parseMeetingDay(dayRaw);
+
+  if (!meetingDay) {
+    await replyEphemeral(
+      interaction,
+      "Invalid day. Use `YYYY-MM-DD` (example: `2026-09-06`), or omit day to use today.",
+    );
+    return;
+  }
+
+  if (!(await deferEphemeral(interaction))) return;
+
+  const { students, unresolved } = await resolveStudents(
+    interaction,
+    collectStudentIds(interaction),
+  );
+  if (unresolved.length > 0 || students.length === 0) {
+    await replyEphemeral(
+      interaction,
+      "Could not resolve one or more mentioned students. Use `@name` for people in this server.",
+    );
+    return;
+  }
+
+  const timestamp = new Date().toISOString();
+  await appendSheetRows({
+    webhookUrl: SHEETS_WEBHOOK_URL,
+    webhookSecret: SHEETS_WEBHOOK_SECRET,
+    type: "raised",
+    students: students.map((student) => ({
+      timestamp,
+      discordUserId: student.discordUserId,
+      discordUsername: student.discordUsername,
+      displayName: student.displayName,
+      amount,
+      meetingDay,
+      note,
+      approvedById: interaction.user.id,
+      approvedByUsername: interaction.user.username,
+      guildId: interaction.guildId || "",
+    })),
+  });
+
+  const dollars = amount.toFixed(2);
+  await replyEphemeral(
+    interaction,
+    [
+      `Logged **$${dollars}** raised for ${formatStudentNames(students)} on **${meetingDay}**.`,
+      note ? `Note: ${note}` : null,
+      "Logged to the Raised sheet. Each listed student is credited that same amount.",
     ]
       .filter(Boolean)
       .join("\n"),
