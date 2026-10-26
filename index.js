@@ -12,7 +12,7 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import { generatePassphrase } from "./src/words.js";
-import { appendSheetRow, appendSheetRows } from "./src/sheets.js";
+import { appendSheetRow, appendSheetRows, fetchStudentStatus } from "./src/sheets.js";
 import { assertHttpsUrl, logError, userFacingError } from "./src/security.js";
 import {
   consumePendingCheckout,
@@ -26,9 +26,10 @@ import {
   isSessionValid,
   loadSession,
   markApprovedEarlyLeave,
-  markAttended,
   meetingDayFor,
   setSession,
+  tryMarkAttended,
+  unmarkAttended,
 } from "./src/session.js";
 
 function requireEnv(name) {
@@ -376,6 +377,19 @@ const commands = [
         .setRequired(false),
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription(
+      "Show attendance %, fundraising, and a breakdown (you + parents in this channel)",
+    )
+    .setDMPermission(false)
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("Mentor only: another student")
+        .setRequired(false),
+    )
+    .toJSON(),
 ];
 
 async function registerCommands() {
@@ -431,6 +445,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleRaised(interaction);
       return;
     }
+    if (interaction.commandName === "status") {
+      await handleStatus(interaction);
+      return;
+    }
   } catch (err) {
     logError("Command failed:", err);
     if (isUnknownInteraction(err)) return;
@@ -476,9 +494,7 @@ async function handleGeneratePassword(interaction) {
 }
 
 async function handleAttendance(interaction) {
-  // Public reply so mentors can see check-ins in the student's private channel.
-  if (!(await deferPublic(interaction))) return;
-
+  // Validate in memory first so a bad password is instant even under load.
   const submitted = interaction.options
     .getString("password", true)
     .trim()
@@ -509,7 +525,7 @@ async function handleAttendance(interaction) {
     return;
   }
 
-  if (hasAttended(interaction.user.id)) {
+  if (hasAttended(interaction.user.id) || !tryMarkAttended(interaction.user.id)) {
     await replyPublic(
       interaction,
       "Your attendance is already recorded for this meeting.",
@@ -518,28 +534,41 @@ async function handleAttendance(interaction) {
   }
 
   const displayName = displayNameOf(interaction);
+  // Public so mentors/parents in this private channel see the check-in immediately.
+  await replyPublic(interaction, `Recording attendance for **${displayName}**…`);
 
-  await appendSheetRow({
-    webhookUrl: SHEETS_WEBHOOK_URL,
-    webhookSecret: SHEETS_WEBHOOK_SECRET,
-    type: "attendance",
-    row: {
-      timestamp: new Date().toISOString(),
-      discordUserId: interaction.user.id,
-      discordUsername: interaction.user.username,
-      displayName,
-      meetingDay: session.meetingDay || meetingDayFor(),
-      meetingId: session.meetingId || "",
-      guildId: interaction.guildId || "",
-    },
-  });
+  try {
+    const result = await appendSheetRow({
+      webhookUrl: SHEETS_WEBHOOK_URL,
+      webhookSecret: SHEETS_WEBHOOK_SECRET,
+      type: "attendance",
+      row: {
+        timestamp: new Date().toISOString(),
+        discordUserId: interaction.user.id,
+        discordUsername: interaction.user.username,
+        displayName,
+        meetingDay: session.meetingDay || meetingDayFor(),
+        meetingId: session.meetingId || "",
+        guildId: interaction.guildId || "",
+      },
+    });
 
-  await markAttended(interaction.user.id);
+    if (result.duplicate) {
+      await replyPublic(
+        interaction,
+        "Your attendance is already recorded for this meeting.",
+      );
+      return;
+    }
 
-  await replyPublic(
-    interaction,
-    `Attendance recorded for **${displayName}**.`,
-  );
+    await replyPublic(
+      interaction,
+      `Attendance recorded for **${displayName}**.`,
+    );
+  } catch (err) {
+    unmarkAttended(interaction.user.id);
+    throw err;
+  }
 }
 
 async function handleCheckout(interaction) {
@@ -620,8 +649,6 @@ async function handleMentorApproveCheckout(interaction, key) {
     return;
   }
 
-  if (!(await deferEphemeral(interaction))) return;
-
   const pending = findPendingCheckout(key);
   if (!pending) {
     await replyEphemeral(
@@ -641,8 +668,13 @@ async function handleMentorApproveCheckout(interaction, key) {
   }
 
   const meetingDay = meetingDayFor();
+  await markApprovedEarlyLeave(consumed.userId, consumed.displayName);
+  await replyEphemeral(
+    interaction,
+    `Logging early leave for **${consumed.displayName}**…`,
+  );
 
-  await appendSheetRow({
+  const result = await appendSheetRow({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
     type: "checkout",
@@ -659,7 +691,13 @@ async function handleMentorApproveCheckout(interaction, key) {
     },
   });
 
-  await markApprovedEarlyLeave(consumed.userId, consumed.displayName);
+  if (result.duplicate) {
+    await replyEphemeral(
+      interaction,
+      `Early leave for **${consumed.displayName}** was already logged today.`,
+    );
+    return;
+  }
 
   await replyEphemeral(
     interaction,
@@ -692,7 +730,7 @@ async function handleComp(interaction) {
   }
 
   const meetingDays = parsedDays.days;
-  if (!(await deferEphemeral(interaction))) return;
+  await replyEphemeral(interaction, "Logging comps…");
 
   const { students, unresolved } = await resolveStudents(
     interaction,
@@ -716,7 +754,7 @@ async function handleComp(interaction) {
   }
 
   const timestamp = new Date().toISOString();
-  await appendSheetRows({
+  const result = await appendSheetRows({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
     type: "comp",
@@ -744,9 +782,12 @@ async function handleComp(interaction) {
   await replyEphemeral(
     interaction,
     [
-      `Comped ${formatStudentNames(students)} for ${dayList}.`,
+      result.added
+        ? `Comped ${formatStudentNames(students)} for ${dayList}.`
+        : `No new comps — those student/day rows were already logged.`,
+      formatDuplicateSkip(result),
       reason ? `Reason: ${reason}` : null,
-      meetingsNote,
+      result.added ? meetingsNote : null,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -789,7 +830,7 @@ async function handleRaised(interaction) {
     return;
   }
 
-  if (!(await deferEphemeral(interaction))) return;
+  await replyEphemeral(interaction, "Logging money raised…");
 
   const { students, unresolved } = await resolveStudents(
     interaction,
@@ -804,7 +845,7 @@ async function handleRaised(interaction) {
   }
 
   const timestamp = new Date().toISOString();
-  await appendSheetRows({
+  const result = await appendSheetRows({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
     type: "raised",
@@ -826,13 +867,113 @@ async function handleRaised(interaction) {
   await replyEphemeral(
     interaction,
     [
-      `Logged **$${dollars}** raised for ${formatStudentNames(students)} on **${meetingDay}**.`,
+      result.added
+        ? `Logged **$${dollars}** raised for ${formatStudentNames(students)} on **${meetingDay}**.`
+        : `No new fundraising rows — that student/day/amount/note was already logged.`,
+      formatDuplicateSkip(result),
       note ? `Note: ${note}` : null,
-      "Logged to the Raised sheet. Each listed student is credited that same amount.",
+      result.added
+        ? "Logged to the Raised sheet. Each listed student is credited that same amount."
+        : null,
     ]
       .filter(Boolean)
       .join("\n"),
   );
+}
+
+async function handleStatus(interaction) {
+  const requested = interaction.options.getUser("user");
+  const lookingUpOther =
+    Boolean(requested) && requested.id !== interaction.user.id;
+
+  if (lookingUpOther && !isMentor(interaction)) {
+    await replyEphemeral(
+      interaction,
+      "Only mentors with **Manage Server** (or Administrator) can view another student's status.",
+    );
+    return;
+  }
+
+  const target = requested || interaction.user;
+  const publicReply = !lookingUpOther;
+
+  if (publicReply) {
+    if (!(await deferPublic(interaction))) return;
+  } else if (!(await deferEphemeral(interaction))) {
+    return;
+  }
+
+  const member = await interaction.guild?.members
+    .fetch(target.id)
+    .catch(() => null);
+  const displayName =
+    member?.displayName || target.globalName || target.username;
+
+  const stats = await fetchStudentStatus({
+    webhookUrl: SHEETS_WEBHOOK_URL,
+    webhookSecret: SHEETS_WEBHOOK_SECRET,
+    discordUserId: target.id,
+  });
+
+  const reply = publicReply ? replyPublic : replyEphemeral;
+  await reply(interaction, formatStatusMessage(displayName, stats));
+}
+
+function formatDuplicateSkip(result) {
+  const skipped = Number(result?.duplicates) || 0;
+  if (!skipped || !result?.added) return null;
+  return `Skipped ${skipped} duplicate row${skipped === 1 ? "" : "s"} (already logged).`;
+}
+
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return "0%";
+  const pct = Math.round(value * 1000) / 10;
+  return Number.isInteger(pct) ? `${pct}%` : `${pct}%`;
+}
+
+function formatMoney(value) {
+  const n = Number(value) || 0;
+  return `$${n.toFixed(2)}`;
+}
+
+function formatStatusMessage(displayName, stats) {
+  const percent = Number(stats.percentWeighted) || 0;
+  const raised = Number(stats.raised) || 0;
+  const attendanceGoal =
+    stats.attendanceGoal == null ? null : Number(stats.attendanceGoal);
+  const raisedGoal = stats.raisedGoal == null ? null : Number(stats.raisedGoal);
+
+  const attendanceGoalLine =
+    attendanceGoal == null
+      ? null
+      : percent >= attendanceGoal
+        ? `  Goal ${formatPercent(attendanceGoal)} — met`
+        : `  Goal ${formatPercent(attendanceGoal)}`;
+
+  let raisedGoalLine = null;
+  if (raisedGoal != null) {
+    raisedGoalLine =
+      raised >= raisedGoal
+        ? `  Goal ${formatMoney(raisedGoal)} — met`
+        : `  Goal ${formatMoney(raisedGoal)} (${formatMoney(raisedGoal - raised)} to go)`;
+  }
+
+  return [
+    `**Season status — ${displayName}**`,
+    "",
+    `Attendance  **${formatPercent(percent)}**`,
+    attendanceGoalLine,
+    `Fundraising  **${formatMoney(raised)}**`,
+    raisedGoalLine,
+    "",
+    "**Breakdown**",
+    `• ${stats.attendedDays || 0} attended · ${stats.checkoutDays || 0} early leave · ${stats.compDays || 0} comp`,
+    `• ${stats.creditedDays || 0} credited days · weighted ${stats.weightedCredit || 0} / ${stats.capacityWeighted || 0}`,
+    "",
+    "_Run this in the student’s private channel so parents can see it._",
+  ]
+    .filter((line) => line != null)
+    .join("\n");
 }
 
 await loadSession();

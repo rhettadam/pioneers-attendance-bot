@@ -1,14 +1,29 @@
 /**
- * Append a row via a Google Apps Script Web App over HTTPS only.
- * Retries when the sheet lock is busy under concurrent load.
+ * Talk to the Google Apps Script Web App over HTTPS only.
+ * Writes are queued in-process so 50 check-ins do not stampede the sheet lock.
+ * Reads (`status`) skip the queue.
  * Errors are coded for internal handling — never expose URLs/secrets to Discord.
- *
+ */
+
+let writeTail = Promise.resolve();
+
+function enqueueWrite(work) {
+  const run = writeTail.then(work, work);
+  writeTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/**
  * @param {{
  *   webhookUrl: string,
  *   webhookSecret: string,
  *   type: "attendance" | "checkout" | "comp" | "raised",
  *   row: Record<string, string | number>,
  * }} args
+ * @returns {Promise<{ ok: true, added?: number, duplicates?: number, duplicate?: boolean }>}
  */
 export async function appendSheetRow({
   webhookUrl,
@@ -16,23 +31,23 @@ export async function appendSheetRow({
   type,
   row,
 }) {
-  return postSheetJson({
-    webhookUrl,
-    webhookSecret,
-    body: { type, ...row },
-  });
+  return enqueueWrite(() =>
+    postSheetJson({
+      webhookUrl,
+      webhookSecret,
+      body: { type, ...row },
+    }),
+  );
 }
 
 /**
- * Append several rows in one webhook POST (`students` array).
- * Used by `/comp` and `/raised` so a mention list is one sheet lock.
- *
  * @param {{
  *   webhookUrl: string,
  *   webhookSecret: string,
  *   type: "comp" | "raised",
  *   students: Record<string, string | number>[],
  * }} args
+ * @returns {Promise<{ ok: true, added?: number, duplicates?: number, duplicate?: boolean }>}
  */
 export async function appendSheetRows({
   webhookUrl,
@@ -40,10 +55,31 @@ export async function appendSheetRows({
   type,
   students,
 }) {
+  return enqueueWrite(() =>
+    postSheetJson({
+      webhookUrl,
+      webhookSecret,
+      body: { type, students },
+    }),
+  );
+}
+
+/**
+ * @param {{
+ *   webhookUrl: string,
+ *   webhookSecret: string,
+ *   discordUserId: string,
+ * }} args
+ */
+export async function fetchStudentStatus({
+  webhookUrl,
+  webhookSecret,
+  discordUserId,
+}) {
   return postSheetJson({
     webhookUrl,
     webhookSecret,
-    body: { type, students },
+    body: { type: "status", discordUserId },
   });
 }
 
@@ -57,7 +93,7 @@ export async function appendSheetRows({
 async function postSheetJson({ webhookUrl, webhookSecret, body }) {
   assertHttps(webhookUrl);
 
-  const maxAttempts = 6;
+  const maxAttempts = 8;
   let lastCode = "unknown";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -65,7 +101,6 @@ async function postSheetJson({ webhookUrl, webhookSecret, body }) {
       const res = await fetchHttpsOnly(webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Secret travels in the TLS-encrypted JSON body — never as a query param
         body: JSON.stringify({
           secret: webhookSecret,
           ...body,
@@ -83,7 +118,7 @@ async function postSheetJson({ webhookUrl, webhookSecret, body }) {
       }
 
       if (res.ok && payload.ok === true) {
-        return;
+        return payload;
       }
 
       const errText = String(payload.error || "");
@@ -153,7 +188,6 @@ async function fetchHttpsOnly(url, init, hop = 0) {
     if (next.protocol !== "https:") {
       throw new Error("INSECURE_REDIRECT");
     }
-    // Redirects after POST to Apps Script are typically GET to the result page
     return fetchHttpsOnly(next.toString(), { method: "GET", redirect: "manual" }, hop + 1);
   }
 
@@ -161,7 +195,8 @@ async function fetchHttpsOnly(url, init, hop = 0) {
 }
 
 function backoffMs(attempt) {
-  return attempt * 1000 + Math.floor(Math.random() * 250);
+  const base = Math.min(1600, 150 * 2 ** (attempt - 1));
+  return base + Math.floor(Math.random() * 80);
 }
 
 function sleep(ms) {

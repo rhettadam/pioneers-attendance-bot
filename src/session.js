@@ -96,27 +96,40 @@ export async function loadSession() {
   return session;
 }
 
+let persistTail = Promise.resolve();
+
+function enqueuePersist(work) {
+  const run = persistTail.then(work, work);
+  persistTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function persistSession() {
-  await mkdir(dataDir, { recursive: true });
-  if (!session) {
-    await writeFile(sessionPath, "null", "utf8");
-    return;
-  }
-  await writeFile(sessionPath, JSON.stringify(session, null, 2), "utf8");
+  return enqueuePersist(async () => {
+    await mkdir(dataDir, { recursive: true });
+    if (!session) {
+      await writeFile(sessionPath, "null", "utf8");
+      return;
+    }
+    await writeFile(sessionPath, JSON.stringify(session), "utf8");
+  });
 }
 
 async function persistCheckouts() {
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(checkoutsPath, JSON.stringify(pendingCheckouts, null, 2), "utf8");
+  return enqueuePersist(async () => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(checkoutsPath, JSON.stringify(pendingCheckouts), "utf8");
+  });
 }
 
 async function persistEarlyLeaves() {
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(
-    earlyLeavesPath,
-    JSON.stringify(approvedEarlyLeaves, null, 2),
-    "utf8",
-  );
+  return enqueuePersist(async () => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(earlyLeavesPath, JSON.stringify(approvedEarlyLeaves), "utf8");
+  });
 }
 
 function pruneExpiredCheckouts() {
@@ -161,12 +174,25 @@ export function hasAttended(userId) {
   return Boolean(session?.attended?.includes(userId));
 }
 
+/** Memory-first claim so a double-tap is rejected before the sheet write. */
+export function tryMarkAttended(userId) {
+  if (!session || !isSessionValid()) return false;
+  if (session.attended.includes(userId)) return false;
+  session.attended.push(userId);
+  void persistSession();
+  return true;
+}
+
 export async function markAttended(userId) {
+  tryMarkAttended(userId);
+}
+
+export function unmarkAttended(userId) {
   if (!session) return;
-  if (!session.attended.includes(userId)) {
-    session.attended.push(userId);
-    await persistSession();
-  }
+  const next = session.attended.filter((id) => id !== userId);
+  if (next.length === session.attended.length) return;
+  session.attended = next;
+  void persistSession();
 }
 
 /**
@@ -192,7 +218,7 @@ export async function markApprovedEarlyLeave(userId, displayName) {
     meetingDay,
     approvedAt: Date.now(),
   });
-  await persistEarlyLeaves();
+  void persistEarlyLeaves();
 }
 
 export async function clearEarlyLeave(userId) {
