@@ -60,6 +60,8 @@ function isUnknownInteraction(err) {
 }
 
 const MAX_STUDENTS_PER_COMMAND = 25;
+const MAX_DAYS_PER_COMMAND = 15;
+const MAX_COMP_ROWS = 80;
 
 /** YYYY-MM-DD only */
 function parseMeetingDay(raw) {
@@ -76,6 +78,49 @@ function parseMeetingDay(raw) {
     return null;
   }
   return trimmed;
+}
+
+/** One or more YYYY-MM-DD values, separated by spaces or commas. Empty → today. */
+function parseMeetingDays(raw) {
+  if (!raw || !raw.trim()) {
+    return { days: [meetingDayFor()], error: null };
+  }
+
+  const tokens = raw
+    .split(/[,;\s]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const days = [];
+  const seen = new Set();
+
+  for (const token of tokens) {
+    const day = parseMeetingDay(token);
+    if (!day) {
+      return {
+        days: [],
+        error: `Invalid day \`${token}\`. Use \`YYYY-MM-DD\` (example: \`2026-09-06\`), or list several: \`2026-09-06, 2026-09-13\`.`,
+      };
+    }
+    if (seen.has(day)) continue;
+    seen.add(day);
+    days.push(day);
+  }
+
+  if (days.length === 0) {
+    return {
+      days: [],
+      error:
+        "Invalid day. Use `YYYY-MM-DD` (example: `2026-09-06`), or omit day to use today.",
+    };
+  }
+  if (days.length > MAX_DAYS_PER_COMMAND) {
+    return {
+      days: [],
+      error: `You can list at most ${MAX_DAYS_PER_COMMAND} days in one command.`,
+    };
+  }
+
+  return { days, error: null };
 }
 
 function parseMentionIds(text) {
@@ -263,7 +308,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("comp")
     .setDescription(
-      "Grant attendance credit for one student or a mention list (mentors only)",
+      "Grant attendance credit for students on one or more days (mentors only)",
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setDMPermission(false)
@@ -282,7 +327,7 @@ const commands = [
     .addStringOption((option) =>
       option
         .setName("day")
-        .setDescription("Meeting day YYYY-MM-DD (default: today)")
+        .setDescription("One or more YYYY-MM-DD days (default: today)")
         .setRequired(false),
     )
     .addStringOption((option) =>
@@ -639,16 +684,14 @@ async function handleComp(interaction) {
 
   const dayRaw = interaction.options.getString("day");
   const reason = (interaction.options.getString("reason") || "").trim();
-  const meetingDay = parseMeetingDay(dayRaw);
+  const parsedDays = parseMeetingDays(dayRaw);
 
-  if (!meetingDay) {
-    await replyEphemeral(
-      interaction,
-      "Invalid day. Use `YYYY-MM-DD` (example: `2026-09-06`), or omit day to use today.",
-    );
+  if (parsedDays.error) {
+    await replyEphemeral(interaction, parsedDays.error);
     return;
   }
 
+  const meetingDays = parsedDays.days;
   if (!(await deferEphemeral(interaction))) return;
 
   const { students, unresolved } = await resolveStudents(
@@ -663,30 +706,47 @@ async function handleComp(interaction) {
     return;
   }
 
+  const rowCount = students.length * meetingDays.length;
+  if (rowCount > MAX_COMP_ROWS) {
+    await replyEphemeral(
+      interaction,
+      `That's ${students.length} students × ${meetingDays.length} days (${rowCount} rows). Split into smaller lists (max ${MAX_COMP_ROWS} rows).`,
+    );
+    return;
+  }
+
   const timestamp = new Date().toISOString();
   await appendSheetRows({
     webhookUrl: SHEETS_WEBHOOK_URL,
     webhookSecret: SHEETS_WEBHOOK_SECRET,
     type: "comp",
-    students: students.map((student) => ({
-      timestamp,
-      discordUserId: student.discordUserId,
-      discordUsername: student.discordUsername,
-      displayName: student.displayName,
-      meetingDay,
-      reason,
-      approvedById: interaction.user.id,
-      approvedByUsername: interaction.user.username,
-      guildId: interaction.guildId || "",
-    })),
+    students: meetingDays.flatMap((meetingDay) =>
+      students.map((student) => ({
+        timestamp,
+        discordUserId: student.discordUserId,
+        discordUsername: student.discordUsername,
+        displayName: student.displayName,
+        meetingDay,
+        reason,
+        approvedById: interaction.user.id,
+        approvedByUsername: interaction.user.username,
+        guildId: interaction.guildId || "",
+      })),
+    ),
   });
+
+  const dayList = meetingDays.map((day) => `**${day}**`).join(", ");
+  const meetingsNote =
+    meetingDays.length === 1
+      ? "Logged to the Comps sheet. Add that day to the Meetings tab if it is not there yet (Sat = weight 2)."
+      : "Logged to the Comps sheet. Add those days to the Meetings tab if they are not there yet (Sat = weight 2).";
 
   await replyEphemeral(
     interaction,
     [
-      `Comped ${formatStudentNames(students)} for **${meetingDay}**.`,
+      `Comped ${formatStudentNames(students)} for ${dayList}.`,
       reason ? `Reason: ${reason}` : null,
-      "Logged to the Comps sheet. Add that day to the Meetings tab if it is not there yet (Sat = weight 2).",
+      meetingsNote,
     ]
       .filter(Boolean)
       .join("\n"),
