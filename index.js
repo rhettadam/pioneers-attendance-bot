@@ -273,6 +273,11 @@ const GUILD_ID = process.env.DISCORD_GUILD_ID || "";
 const SHEETS_WEBHOOK_URL = requireEnv("SHEETS_WEBHOOK_URL");
 const SHEETS_WEBHOOK_SECRET = requireEnv("SHEETS_WEBHOOK_SECRET");
 assertHttpsUrl(SHEETS_WEBHOOK_URL, "SHEETS_WEBHOOK_URL");
+if (SHEETS_WEBHOOK_URL.includes("/dev")) {
+  console.error(
+    "SHEETS_WEBHOOK_URL looks like a /dev link. That always requires Google login. Use the /exec URL from Deploy → Manage deployments.",
+  );
+}
 const TTL_MINUTES = Number(process.env.PASSWORD_TTL_MINUTES || "20");
 const CHECKOUT_TTL_MINUTES = Number(process.env.CHECKOUT_KEY_TTL_MINUTES || "15");
 
@@ -991,8 +996,14 @@ try {
   console.log("Sheets webhook OK.");
 } catch (err) {
   logError("Sheets webhook check failed:", err);
-  console.error(
-    "Attendance writes will fail until this is fixed. Common causes: Apps Script not deployed as Anyone, secret mismatch, or the sheet formulas are timing out.",
-  );
+  if (err && typeof err === "object" && err.code === "google_auth_page") {
+    console.error(
+      "Fix: Apps Script → Deploy → Manage deployments → Edit. Execute as: Me. Who has access: Anyone. Then New version → Deploy. Use the /exec URL, not /dev.",
+    );
+  } else {
+    console.error(
+      "Attendance writes will fail until this is fixed. Common causes: Apps Script not deployed as Anyone, secret mismatch, or the sheet formulas are timing out.",
+    );
+  }
 }
 await client.login(TOKEN);

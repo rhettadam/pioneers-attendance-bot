@@ -114,7 +114,8 @@ async function postSheetJson({ webhookUrl, webhookSecret, body }) {
       const res = await fetchHttpsOnly(webhookUrl, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
+          // text/plain: application/json makes Apps Script return a login HTML page
+          "Content-Type": "text/plain;charset=utf-8",
           Accept: "application/json, text/plain, */*",
         },
         body: JSON.stringify({
@@ -242,7 +243,8 @@ function classifyBody(status, text, payload) {
   ) {
     return {
       code: "google_auth_page",
-      detail: "Google returned a login/authorization page instead of JSON",
+      detail:
+        "Web app is not public. Deploy → Manage deployments → Who has access: Anyone (not “Anyone with a Google account”). Use the /exec URL, then New version.",
       retry: false,
     };
   }
@@ -261,35 +263,13 @@ function assertHttps(url) {
 }
 
 /**
- * Follow redirects manually and refuse any non-HTTPS hop.
- * If the runtime hides Location, fall back to automatic HTTPS follow.
+ * Apps Script always 302s to script.googleusercontent.com with cookies.
+ * Follow automatically (curl -L). Manual hops without those cookies look
+ * like a Google login page even when the web app is public.
  */
-async function fetchHttpsOnly(url, init, hop = 0) {
+async function fetchHttpsOnly(url, init) {
   assertHttps(url);
-  if (hop > 5) {
-    throw new Error("INSECURE_REDIRECT");
-  }
-
-  const res = await fetch(url, { ...init, redirect: "manual" });
-
-  if (res.status >= 300 && res.status < 400) {
-    const location = res.headers.get("location");
-    if (!location) {
-      return fetch(url, { ...init, redirect: "follow" });
-    }
-    const next = new URL(location, url);
-    if (next.protocol !== "https:") {
-      throw new Error("INSECURE_REDIRECT");
-    }
-    const replay = res.status === 307 || res.status === 308;
-    return fetchHttpsOnly(
-      next.toString(),
-      replay ? { ...init } : { method: "GET", signal: init?.signal },
-      hop + 1,
-    );
-  }
-
-  return res;
+  return fetch(url, { ...init, redirect: "follow" });
 }
 
 function backoffMs(attempt) {
