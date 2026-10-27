@@ -19,7 +19,10 @@ export function userFacingError(_err) {
 export function sanitizeForLog(value) {
   if (value == null) return String(value);
   if (value instanceof Error) {
-    return sanitizeForLog(value.message);
+    const code = "code" in value && value.code ? ` [${value.code}]` : "";
+    const detail =
+      "detail" in value && value.detail ? ` ${String(value.detail)}` : "";
+    return sanitizeForLog(`${value.message}${code}${detail}`);
   }
   let text = typeof value === "string" ? value : safeStringify(value);
   text = text.replace(SENSITIVE, "[redacted]");

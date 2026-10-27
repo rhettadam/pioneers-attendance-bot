@@ -84,6 +84,18 @@ export async function fetchStudentStatus({
 }
 
 /**
+ * Secret-only ping. Does not touch the spreadsheet once Code.gs is redeployed.
+ * @param {{ webhookUrl: string, webhookSecret: string }} args
+ */
+export async function checkSheetWebhook({ webhookUrl, webhookSecret }) {
+  return postSheetJson({
+    webhookUrl,
+    webhookSecret,
+    body: { type: "ping" },
+  });
+}
+
+/**
  * @param {{
  *   webhookUrl: string,
  *   webhookSecret: string,
@@ -95,16 +107,21 @@ async function postSheetJson({ webhookUrl, webhookSecret, body }) {
 
   const maxAttempts = 8;
   let lastCode = "unknown";
+  let lastDetail = "";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetchHttpsOnly(webhookUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/plain, */*",
+        },
         body: JSON.stringify({
           secret: webhookSecret,
           ...body,
         }),
+        signal: requestSignal(),
       });
 
       const text = await res.text();
@@ -112,69 +129,145 @@ async function postSheetJson({ webhookUrl, webhookSecret, body }) {
       try {
         payload = JSON.parse(text);
       } catch {
-        lastCode = `bad_response_${res.status}`;
-        await sleep(backoffMs(attempt));
-        continue;
+        const classified = classifyBody(res.status, text, null);
+        lastCode = classified.code;
+        lastDetail = classified.detail;
+        if (classified.retry && attempt < maxAttempts) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw fail(lastCode, lastDetail);
       }
 
       if (res.ok && payload.ok === true) {
+        if (isDoGetProbe(payload) && body.type !== "ping") {
+          lastCode = "hit_doget";
+          lastDetail = "POST landed on doGet (redirect dropped the body)";
+          if (attempt < maxAttempts) {
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw fail(lastCode, lastDetail);
+        }
         return payload;
       }
 
-      const errText = String(payload.error || "");
-      const busy = errText.toLowerCase().includes("busy");
-      lastCode = busy ? "busy" : `rejected_${res.status}`;
-
-      if (busy && attempt < maxAttempts) {
+      const classified = classifyBody(res.status, text, payload);
+      lastCode = classified.code;
+      lastDetail = classified.detail;
+      if (classified.retry && attempt < maxAttempts) {
         await sleep(backoffMs(attempt));
         continue;
       }
-
-      const error = new Error("SHEETS_WRITE_FAILED");
-      error.code = lastCode;
-      throw error;
+      throw fail(lastCode, lastDetail);
     } catch (err) {
       if (err instanceof Error && err.message === "SHEETS_WRITE_FAILED") {
         throw err;
       }
       if (err instanceof Error && err.message === "INSECURE_REDIRECT") {
-        const error = new Error("SHEETS_WRITE_FAILED");
-        error.code = "insecure_redirect";
-        throw error;
+        throw fail("insecure_redirect");
       }
-      lastCode = "network";
+      lastCode = isTimeout(err) ? "timeout" : "network";
+      lastDetail = err instanceof Error ? err.message : "request failed";
       if (attempt < maxAttempts) {
         await sleep(backoffMs(attempt));
         continue;
       }
-      const error = new Error("SHEETS_WRITE_FAILED");
-      error.code = lastCode;
-      throw error;
+      throw fail(lastCode, lastDetail);
     }
   }
 
+  throw fail(lastCode, lastDetail);
+}
+
+function requestSignal() {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(20_000);
+  }
+  return undefined;
+}
+
+function fail(code, detail = "") {
   const error = new Error("SHEETS_WRITE_FAILED");
-  error.code = lastCode;
-  throw error;
+  error.code = code;
+  if (detail) error.detail = String(detail).slice(0, 180);
+  return error;
+}
+
+function isTimeout(err) {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      "name" in err &&
+      (err.name === "TimeoutError" || err.name === "AbortError"),
+  );
+}
+
+function isDoGetProbe(payload) {
+  return (
+    typeof payload?.message === "string" &&
+    payload.message.toLowerCase().includes("webhook is live")
+  );
+}
+
+function classifyBody(status, text, payload) {
+  if (payload && typeof payload === "object") {
+    const errText = String(payload.error || "");
+    const lower = errText.toLowerCase();
+    if (lower.includes("busy")) {
+      return { code: "busy", detail: errText, retry: true };
+    }
+    if (lower.includes("unauthorized")) {
+      return { code: "unauthorized", detail: errText, retry: false };
+    }
+    if (lower.includes("missing sheet tab")) {
+      return { code: "missing_tab", detail: errText, retry: false };
+    }
+    if (lower.includes("timed out") || lower.includes("exceeded maximum")) {
+      return { code: "sheet_timeout", detail: errText, retry: true };
+    }
+    return {
+      code: `rejected_${status}`,
+      detail: errText || `HTTP ${status}`,
+      retry: false,
+    };
+  }
+
+  const snippet = String(text || "").replace(/\s+/g, " ").slice(0, 120);
+  if (
+    /<html/i.test(text) ||
+    /sign in/i.test(text) ||
+    /accounts\.google/i.test(text) ||
+    /unverified/i.test(text)
+  ) {
+    return {
+      code: "google_auth_page",
+      detail: "Google returned a login/authorization page instead of JSON",
+      retry: false,
+    };
+  }
+  return {
+    code: `bad_response_${status}`,
+    detail: snippet || `HTTP ${status}`,
+    retry: true,
+  };
 }
 
 function assertHttps(url) {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:") {
-    const error = new Error("SHEETS_WRITE_FAILED");
-    error.code = "insecure_url";
-    throw error;
+    throw fail("insecure_url");
   }
 }
 
 /**
  * Follow redirects manually and refuse any non-HTTPS hop.
+ * If the runtime hides Location, fall back to automatic HTTPS follow.
  */
 async function fetchHttpsOnly(url, init, hop = 0) {
   assertHttps(url);
   if (hop > 5) {
-    const error = new Error("INSECURE_REDIRECT");
-    throw error;
+    throw new Error("INSECURE_REDIRECT");
   }
 
   const res = await fetch(url, { ...init, redirect: "manual" });
@@ -182,13 +275,18 @@ async function fetchHttpsOnly(url, init, hop = 0) {
   if (res.status >= 300 && res.status < 400) {
     const location = res.headers.get("location");
     if (!location) {
-      throw new Error("INSECURE_REDIRECT");
+      return fetch(url, { ...init, redirect: "follow" });
     }
     const next = new URL(location, url);
     if (next.protocol !== "https:") {
       throw new Error("INSECURE_REDIRECT");
     }
-    return fetchHttpsOnly(next.toString(), { method: "GET", redirect: "manual" }, hop + 1);
+    const replay = res.status === 307 || res.status === 308;
+    return fetchHttpsOnly(
+      next.toString(),
+      replay ? { ...init } : { method: "GET", signal: init?.signal },
+      hop + 1,
+    );
   }
 
   return res;

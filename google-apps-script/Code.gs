@@ -17,13 +17,23 @@ const SETTINGS_TAB = "Settings";
 const WEBHOOK_SECRET = "change-me-to-a-long-random-string";
 
 function doPost(e) {
-  const data = JSON.parse((e.postData && e.postData.contents) || "{}");
+  let data;
+  try {
+    data = JSON.parse((e.postData && e.postData.contents) || "{}");
+  } catch (err) {
+    return json_({ ok: false, error: "Invalid JSON body" });
+  }
 
   if (!data.secret || data.secret !== WEBHOOK_SECRET) {
     return json_({ ok: false, error: "Unauthorized" });
   }
 
   const type = data.type || "attendance";
+
+  // Secret check only — used by the bot at startup.
+  if (type === "ping") {
+    return json_({ ok: true, ping: true });
+  }
 
   // Reads must not wait behind 50 check-in writes.
   if (type === "status") {
@@ -142,13 +152,22 @@ function raisedKey_(userId, day, amount, note) {
   );
 }
 
+function recentRowWindow_(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 2) return null;
+  // Season ARRAYFORMULAs make full-column reads stall the web app.
+  // Recent rows + CacheService are enough to catch same-day duplicates.
+  const start = Math.max(2, last - 499);
+  return { start: start, count: last - start + 1 };
+}
+
 function loadDayIndex_(sheet) {
   const seen = {};
   if (!sheet) return seen;
-  const last = sheet.getLastRow();
-  if (last < 2) return seen;
-  const users = sheet.getRange(2, 2, last - 1, 1).getValues();
-  const days = sheet.getRange(2, 5, last - 1, 1).getValues();
+  const window = recentRowWindow_(sheet);
+  if (!window) return seen;
+  const users = sheet.getRange(window.start, 2, window.count, 1).getValues();
+  const days = sheet.getRange(window.start, 5, window.count, 1).getValues();
   for (let i = 0; i < users.length; i++) {
     const id = String(users[i][0] || "");
     const day = cellDay_(days[i][0]);
@@ -160,9 +179,9 @@ function loadDayIndex_(sheet) {
 function loadRaisedIndex_(sheet) {
   const seen = {};
   if (!sheet) return seen;
-  const last = sheet.getLastRow();
-  if (last < 2) return seen;
-  const rows = sheet.getRange(2, 2, last - 1, 6).getValues();
+  const window = recentRowWindow_(sheet);
+  if (!window) return seen;
+  const rows = sheet.getRange(window.start, 2, window.count, 6).getValues();
   for (let i = 0; i < rows.length; i++) {
     const id = String(rows[i][0] || "");
     const amount = rows[i][3];

@@ -12,7 +12,12 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import { generatePassphrase } from "./src/words.js";
-import { appendSheetRow, appendSheetRows, fetchStudentStatus } from "./src/sheets.js";
+import {
+  appendSheetRow,
+  appendSheetRows,
+  checkSheetWebhook,
+  fetchStudentStatus,
+} from "./src/sheets.js";
 import { assertHttpsUrl, logError, userFacingError } from "./src/security.js";
 import {
   consumePendingCheckout,
@@ -978,4 +983,16 @@ function formatStatusMessage(displayName, stats) {
 
 await loadSession();
 await registerCommands();
+try {
+  await checkSheetWebhook({
+    webhookUrl: SHEETS_WEBHOOK_URL,
+    webhookSecret: SHEETS_WEBHOOK_SECRET,
+  });
+  console.log("Sheets webhook OK.");
+} catch (err) {
+  logError("Sheets webhook check failed:", err);
+  console.error(
+    "Attendance writes will fail until this is fixed. Common causes: Apps Script not deployed as Anyone, secret mismatch, or the sheet formulas are timing out.",
+  );
+}
 await client.login(TOKEN);
